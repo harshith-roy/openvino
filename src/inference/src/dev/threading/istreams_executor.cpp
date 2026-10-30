@@ -239,15 +239,45 @@ void IStreamsExecutor::Config::update_executor_config() {
             const int efficient_cores = proc_type_table[0][EFFICIENT_CORE_PROC];
             const int lp_efficient_cores = proc_type_table[0][LP_EFFICIENT_CORE_PROC];
             const int total_efficient_cores = efficient_cores + lp_efficient_cores;
-            int efficient_streams = _streams * efficient_cores / total_efficient_cores;
-            int lp_efficient_streams = _streams * lp_efficient_cores / total_efficient_cores;
-            int remaining_streams = _streams - efficient_streams - lp_efficient_streams;
-            while (remaining_streams-- > 0) {
-                if (efficient_cores - efficient_streams * _threads_per_stream >=
-                    lp_efficient_cores - lp_efficient_streams * _threads_per_stream) {
-                    ++efficient_streams;
-                } else {
-                    ++lp_efficient_streams;
+
+            int efficient_streams = 0;
+            int lp_efficient_streams = 0;
+
+            if (total_efficient_cores > 0) {
+                const int efficient_capacity = efficient_cores / _threads_per_stream;
+                const int lp_efficient_capacity = lp_efficient_cores / _threads_per_stream;
+                const int target_streams =
+                    std::min(_streams, efficient_capacity + lp_efficient_capacity);
+
+                const int efficient_quota = target_streams * efficient_cores;
+                const int lp_quota = target_streams * lp_efficient_cores;
+
+                efficient_streams =
+                    std::min(efficient_capacity, efficient_quota / total_efficient_cores);
+                lp_efficient_streams =
+                    std::min(lp_efficient_capacity, lp_quota / total_efficient_cores);
+
+                int remaining_streams = target_streams - efficient_streams - lp_efficient_streams;
+                while (remaining_streams > 0) {
+                    const bool efficient_has_capacity = efficient_streams < efficient_capacity;
+                    const bool lp_has_capacity = lp_efficient_streams < lp_efficient_capacity;
+
+                    if (!efficient_has_capacity && !lp_has_capacity) {
+                        break;
+                    }
+
+                    const int efficient_deficit =
+                        efficient_quota - efficient_streams * total_efficient_cores;
+                    const int lp_deficit =
+                        lp_quota - lp_efficient_streams * total_efficient_cores;
+
+                    if (efficient_has_capacity &&
+                        (!lp_has_capacity || efficient_deficit >= lp_deficit)) {
+                        ++efficient_streams;
+                    } else {
+                        ++lp_efficient_streams;
+                    }
+                    --remaining_streams;
                 }
             }
             if (efficient_streams > 0) {
@@ -259,6 +289,46 @@ void IStreamsExecutor::Config::update_executor_config() {
                 stream_info[PROC_TYPE] = LP_EFFICIENT_CORE_PROC;
                 stream_info[NUMBER_OF_STREAMS] = lp_efficient_streams;
                 _streams_info_table.push_back(std::move(stream_info));
+            }
+            const int composite_streams =
+                std::min(_streams - efficient_streams - lp_efficient_streams,
+                         (efficient_cores - efficient_streams * _threads_per_stream +
+                          lp_efficient_cores - lp_efficient_streams * _threads_per_stream) /
+                             _threads_per_stream);
+            if (composite_streams > 0) {
+                const int remaining_efficient_cores = efficient_cores - efficient_streams * _threads_per_stream;
+                const int remaining_lp_efficient_cores =
+                    lp_efficient_cores - lp_efficient_streams * _threads_per_stream;
+                const int remaining_cores = remaining_efficient_cores + remaining_lp_efficient_cores;
+                const int min_efficient_threads =
+                    std::max(1, _threads_per_stream - remaining_lp_efficient_cores / composite_streams);
+                const int max_efficient_threads =
+                    std::min(_threads_per_stream - 1, remaining_efficient_cores / composite_streams);
+                OPENVINO_ASSERT(min_efficient_threads <= max_efficient_threads,
+                                "Unable to split an ECORE_ONLY stream across standard and LP E-cores.");
+                int efficient_threads =
+                    (_threads_per_stream * remaining_efficient_cores + remaining_cores / 2) / remaining_cores;
+                efficient_threads = std::max(min_efficient_threads, std::min(efficient_threads, max_efficient_threads));
+                const int lp_efficient_threads = _threads_per_stream - efficient_threads;
+
+                std::vector<int> composite_info(CPU_STREAMS_TABLE_SIZE, 0);
+                composite_info[NUMBER_OF_STREAMS] = composite_streams;
+                composite_info[PROC_TYPE] = ALL_PROC;
+                composite_info[THREADS_PER_STREAM] = _threads_per_stream;
+                composite_info[STREAM_NUMA_NODE_ID] = 0;
+                composite_info[STREAM_SOCKET_ID] = 0;
+                _streams_info_table.push_back(std::move(composite_info));
+
+                std::vector<int> component_info(CPU_STREAMS_TABLE_SIZE, 0);
+                component_info[PROC_TYPE] = EFFICIENT_CORE_PROC;
+                component_info[THREADS_PER_STREAM] = efficient_threads;
+                component_info[STREAM_NUMA_NODE_ID] = 0;
+                component_info[STREAM_SOCKET_ID] = 0;
+                _streams_info_table.push_back(component_info);
+
+                component_info[PROC_TYPE] = LP_EFFICIENT_CORE_PROC;
+                component_info[THREADS_PER_STREAM] = lp_efficient_threads;
+                _streams_info_table.push_back(std::move(component_info));
             }
         } else {
             int start = proc_type_table.size() > 1 ? 1 : 0;
@@ -318,6 +388,8 @@ void IStreamsExecutor::Config::update_executor_config() {
             }
         }
     }
+
+    OPENVINO_ASSERT(!_streams_info_table.empty(), "No CPU stream allocation could be created.");
 
     if (_cpu_pinning || _cpu_reservation) {
         reserve_available_cpus(_streams_info_table, _stream_processor_ids, _cpu_reservation ? CPU_USED : NOT_USED);

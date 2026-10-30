@@ -66,6 +66,12 @@ public:
             test_data._proc_type_table[0][LP_EFFICIENT_CORE_PROC] == 1) {
             ASSERT_EQ(3, config.get_streams());
         }
+        if (test_data._num_streams == 1 && test_data._threads_per_stream == 3 &&
+            test_data._core_type == ov::hint::SchedulingCoreType::ECORE_ONLY &&
+            test_data._proc_type_table[0][EFFICIENT_CORE_PROC] == 2 &&
+            test_data._proc_type_table[0][LP_EFFICIENT_CORE_PROC] == 2) {
+            ASSERT_EQ(1, config.get_streams());
+        }
         for (const auto& stream_processors : config.get_stream_processor_ids()) {
             ASSERT_FALSE(stream_processors.empty());
         }
@@ -1551,6 +1557,67 @@ ExecutorConfigTestCase _lp_ecore_only_streams_2_threads_1 = {
     {},
 };
 
+ExecutorConfigTestCase _mixed_ecore_streams_2_threads_1_binding = {
+    {{8, 2, 4, 2, 0, 0, 0}},
+    {{0, 0, 0, 0, MAIN_CORE_PROC, 0, -1},
+     {1, 0, 0, 1, MAIN_CORE_PROC, 1, -1},
+     {2, 0, 0, 2, EFFICIENT_CORE_PROC, 2, -1},
+     {3, 0, 0, 3, EFFICIENT_CORE_PROC, 3, -1},
+     {4, 0, 0, 4, EFFICIENT_CORE_PROC, 4, -1},
+     {5, 0, 0, 5, EFFICIENT_CORE_PROC, 5, -1},
+     {6, 0, 0, 6, LP_EFFICIENT_CORE_PROC, 6, -1},
+     {7, 0, 0, 7, LP_EFFICIENT_CORE_PROC, 7, -1}},
+    2,
+    1,
+    ov::hint::SchedulingCoreType::ECORE_ONLY,
+    true,
+    true,
+    true,
+    {},
+    {{1, EFFICIENT_CORE_PROC, 1, 0, 0}, {1, LP_EFFICIENT_CORE_PROC, 1, 0, 0}},
+    {{2}, {6}},
+};
+
+ExecutorConfigTestCase _mixed_ecore_stream_spans_small_pools_binding = {
+    {{4, 0, 2, 2, 0, 0, 0}},
+    {{0, 0, 0, 0, EFFICIENT_CORE_PROC, 0, -1},
+     {1, 0, 0, 1, EFFICIENT_CORE_PROC, 1, -1},
+     {2, 0, 0, 2, LP_EFFICIENT_CORE_PROC, 2, -1},
+     {3, 0, 0, 3, LP_EFFICIENT_CORE_PROC, 3, -1}},
+    1,
+    3,
+    ov::hint::SchedulingCoreType::ECORE_ONLY,
+    true,
+    true,
+    true,
+    {},
+    {{1, ALL_PROC, 3, 0, 0},
+     {0, EFFICIENT_CORE_PROC, 2, 0, 0},
+     {0, LP_EFFICIENT_CORE_PROC, 1, 0, 0}},
+    {{0, 1, 2}},
+};
+
+ExecutorConfigTestCase _mixed_ecore_streams_2_threads_1 = {
+    {{8, 2, 4, 2, 0, 0, 0}},
+    {{0, 0, 0, 0, MAIN_CORE_PROC, 0, -1},
+     {1, 0, 0, 1, MAIN_CORE_PROC, 1, -1},
+     {2, 0, 0, 2, EFFICIENT_CORE_PROC, 2, -1},
+     {3, 0, 0, 3, EFFICIENT_CORE_PROC, 3, -1},
+     {4, 0, 0, 4, EFFICIENT_CORE_PROC, 4, -1},
+     {5, 0, 0, 5, EFFICIENT_CORE_PROC, 5, -1},
+     {6, 0, 0, 6, LP_EFFICIENT_CORE_PROC, 6, -1},
+     {7, 0, 0, 7, LP_EFFICIENT_CORE_PROC, 7, -1}},
+    2,
+    1,
+    ov::hint::SchedulingCoreType::ECORE_ONLY,
+    false,
+    false,
+    true,
+    {},
+    {{1, EFFICIENT_CORE_PROC, 1, 0, 0}, {1, LP_EFFICIENT_CORE_PROC, 1, 0, 0}},
+    {},
+};
+
 ExecutorConfigTestCase _mixed_ecore_streams_4_threads_1 = {
     {{8, 2, 4, 2, 0, 0, 0}},
     {{0, 0, 0, 0, MAIN_CORE_PROC, 0, -1},
@@ -1637,6 +1704,9 @@ INSTANTIATE_TEST_SUITE_P(smoke_ExecutorConfig,
                                          _lp_ecore_only_streams_1_threads_4,
                                          _lp_ecore_only_streams_1_threads_4_ecore,
                                          _lp_ecore_only_streams_2_threads_1,
+                                         _mixed_ecore_streams_2_threads_1,
+                                         _mixed_ecore_streams_2_threads_1_binding,
+                                         _mixed_ecore_stream_spans_small_pools_binding,
                                          _mixed_ecore_streams_4_threads_1,
                                          _any_core_streams_3_threads_2_uneven_rows));
 #endif
