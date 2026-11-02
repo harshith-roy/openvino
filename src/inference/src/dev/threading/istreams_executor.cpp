@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <future>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -236,99 +237,154 @@ void IStreamsExecutor::Config::update_executor_config() {
         stream_info[STREAM_SOCKET_ID] = 0;
         int cur_threads = _streams * _threads_per_stream;
         if (_thread_preferred_core_type == ov::hint::SchedulingCoreType::ECORE_ONLY) {
-            const int efficient_cores = proc_type_table[0][EFFICIENT_CORE_PROC];
-            const int lp_efficient_cores = proc_type_table[0][LP_EFFICIENT_CORE_PROC];
-            const int total_efficient_cores = efficient_cores + lp_efficient_cores;
+            struct EcorePool {
+                int proc_type;
+                int numa_node_id;
+                int socket_id;
+                int cores;
+                int stream_capacity;
+                int streams = 0;
+                int remaining_cores = 0;
+            };
 
-            int efficient_streams = 0;
-            int lp_efficient_streams = 0;
-
-            if (total_efficient_cores > 0) {
-                const int efficient_capacity = efficient_cores / _threads_per_stream;
-                const int lp_efficient_capacity = lp_efficient_cores / _threads_per_stream;
-                const int target_streams =
-                    std::min(_streams, efficient_capacity + lp_efficient_capacity);
-
-                const int efficient_quota = target_streams * efficient_cores;
-                const int lp_quota = target_streams * lp_efficient_cores;
-
-                efficient_streams =
-                    std::min(efficient_capacity, efficient_quota / total_efficient_cores);
-                lp_efficient_streams =
-                    std::min(lp_efficient_capacity, lp_quota / total_efficient_cores);
-
-                int remaining_streams = target_streams - efficient_streams - lp_efficient_streams;
-                while (remaining_streams > 0) {
-                    const bool efficient_has_capacity = efficient_streams < efficient_capacity;
-                    const bool lp_has_capacity = lp_efficient_streams < lp_efficient_capacity;
-
-                    if (!efficient_has_capacity && !lp_has_capacity) {
-                        break;
+            std::vector<EcorePool> pools;
+            const size_t first_domain = proc_type_table.size() > 1 ? 1 : 0;
+            int total_cores = 0;
+            int total_stream_capacity = 0;
+            for (size_t row = first_domain; row < proc_type_table.size(); ++row) {
+                for (const int proc_type : {EFFICIENT_CORE_PROC, LP_EFFICIENT_CORE_PROC}) {
+                    const int cores = proc_type_table[row][proc_type];
+                    if (cores > 0) {
+                        const int capacity = cores / _threads_per_stream;
+                        pools.push_back({proc_type,
+                                         proc_type_table[row][PROC_NUMA_NODE_ID],
+                                         proc_type_table[row][PROC_SOCKET_ID],
+                                         cores,
+                                         capacity});
+                        total_cores += cores;
+                        total_stream_capacity += capacity;
                     }
-
-                    const int efficient_deficit =
-                        efficient_quota - efficient_streams * total_efficient_cores;
-                    const int lp_deficit =
-                        lp_quota - lp_efficient_streams * total_efficient_cores;
-
-                    if (efficient_has_capacity &&
-                        (!lp_has_capacity || efficient_deficit >= lp_deficit)) {
-                        ++efficient_streams;
-                    } else {
-                        ++lp_efficient_streams;
-                    }
-                    --remaining_streams;
                 }
             }
-            if (efficient_streams > 0) {
-                stream_info[PROC_TYPE] = EFFICIENT_CORE_PROC;
-                stream_info[NUMBER_OF_STREAMS] = efficient_streams;
-                _streams_info_table.push_back(stream_info);
+
+            const int target_streams = std::min(_streams, total_stream_capacity);
+            int allocated_streams = 0;
+            for (auto& pool : pools) {
+                const long long weighted_stream_quota =
+                    total_cores > 0 ? static_cast<long long>(target_streams) * pool.cores / total_cores : 0;
+                pool.streams = std::min(pool.stream_capacity, static_cast<int>(weighted_stream_quota));
+                allocated_streams += pool.streams;
             }
-            if (lp_efficient_streams > 0) {
-                stream_info[PROC_TYPE] = LP_EFFICIENT_CORE_PROC;
-                stream_info[NUMBER_OF_STREAMS] = lp_efficient_streams;
-                _streams_info_table.push_back(std::move(stream_info));
+            while (allocated_streams < target_streams) {
+                auto best_pool = pools.end();
+                long long best_deficit = std::numeric_limits<long long>::min();
+                for (auto pool = pools.begin(); pool != pools.end(); ++pool) {
+                    if (pool->streams >= pool->stream_capacity) {
+                        continue;
+                    }
+                    const long long deficit =
+                        static_cast<long long>(target_streams) * pool->cores -
+                        static_cast<long long>(pool->streams) * total_cores;
+                    if (deficit > best_deficit) {
+                        best_deficit = deficit;
+                        best_pool = pool;
+                    }
+                }
+                if (best_pool == pools.end()) {
+                    break;
+                }
+                ++best_pool->streams;
+                ++allocated_streams;
+            }
+
+            for (auto& pool : pools) {
+                if (pool.streams > 0) {
+                    auto row_info = stream_info;
+                    row_info[NUMBER_OF_STREAMS] = pool.streams;
+                    row_info[PROC_TYPE] = pool.proc_type;
+                    row_info[STREAM_NUMA_NODE_ID] = pool.numa_node_id;
+                    row_info[STREAM_SOCKET_ID] = pool.socket_id;
+                    _streams_info_table.push_back(std::move(row_info));
+                }
+                pool.remaining_cores = pool.cores - pool.streams * _threads_per_stream;
+            }
+
+            int remaining_cores = 0;
+            for (const auto& pool : pools) {
+                remaining_cores += pool.remaining_cores;
             }
             const int composite_streams =
-                std::min(_streams - efficient_streams - lp_efficient_streams,
-                         (efficient_cores - efficient_streams * _threads_per_stream +
-                          lp_efficient_cores - lp_efficient_streams * _threads_per_stream) /
-                             _threads_per_stream);
-            if (composite_streams > 0) {
-                const int remaining_efficient_cores = efficient_cores - efficient_streams * _threads_per_stream;
-                const int remaining_lp_efficient_cores =
-                    lp_efficient_cores - lp_efficient_streams * _threads_per_stream;
-                const int remaining_cores = remaining_efficient_cores + remaining_lp_efficient_cores;
-                const int min_efficient_threads =
-                    std::max(1, _threads_per_stream - remaining_lp_efficient_cores / composite_streams);
-                const int max_efficient_threads =
-                    std::min(_threads_per_stream - 1, remaining_efficient_cores / composite_streams);
-                OPENVINO_ASSERT(min_efficient_threads <= max_efficient_threads,
-                                "Unable to split an ECORE_ONLY stream across standard and LP E-cores.");
-                int efficient_threads =
-                    (_threads_per_stream * remaining_efficient_cores + remaining_cores / 2) / remaining_cores;
-                efficient_threads = std::max(min_efficient_threads, std::min(efficient_threads, max_efficient_threads));
-                const int lp_efficient_threads = _threads_per_stream - efficient_threads;
+                std::min(_streams - allocated_streams, remaining_cores / _threads_per_stream);
+            for (int stream = 0; stream < composite_streams; ++stream) {
+                int composite_capacity = 0;
+                for (const auto& pool : pools) {
+                    composite_capacity += pool.remaining_cores;
+                }
+                std::vector<int> component_cores(pools.size(), 0);
+                std::vector<long long> remainders(pools.size(), -1);
+                int assigned_cores = 0;
+                for (size_t i = 0; i < pools.size(); ++i) {
+                    if (pools[i].remaining_cores > 0) {
+                        const long long numerator =
+                            static_cast<long long>(_threads_per_stream) * pools[i].remaining_cores;
+                        component_cores[i] = static_cast<int>(numerator / composite_capacity);
+                        remainders[i] = numerator % composite_capacity;
+                        assigned_cores += component_cores[i];
+                    }
+                }
+                while (assigned_cores < _threads_per_stream) {
+                    size_t best_pool = pools.size();
+                    for (size_t i = 0; i < pools.size(); ++i) {
+                        if (component_cores[i] < pools[i].remaining_cores &&
+                            (best_pool == pools.size() || remainders[i] > remainders[best_pool])) {
+                            best_pool = i;
+                        }
+                    }
+                    OPENVINO_ASSERT(best_pool < pools.size(),
+                                    "Unable to distribute ECORE_ONLY composite stream across available pools.");
+                    ++component_cores[best_pool];
+                    remainders[best_pool] = -1;
+                    ++assigned_cores;
+                }
+
+                int composite_numa_node = -1;
+                int composite_socket = -1;
+                bool first_component = true;
+                bool spans_domains = false;
+                for (size_t i = 0; i < pools.size(); ++i) {
+                    if (component_cores[i] == 0) {
+                        continue;
+                    }
+                    if (first_component) {
+                        composite_numa_node = pools[i].numa_node_id;
+                        composite_socket = pools[i].socket_id;
+                        first_component = false;
+                    } else if (composite_numa_node != pools[i].numa_node_id ||
+                               composite_socket != pools[i].socket_id) {
+                        spans_domains = true;
+                    }
+                }
 
                 std::vector<int> composite_info(CPU_STREAMS_TABLE_SIZE, 0);
-                composite_info[NUMBER_OF_STREAMS] = composite_streams;
+                composite_info[NUMBER_OF_STREAMS] = 1;
                 composite_info[PROC_TYPE] = ALL_PROC;
                 composite_info[THREADS_PER_STREAM] = _threads_per_stream;
-                composite_info[STREAM_NUMA_NODE_ID] = 0;
-                composite_info[STREAM_SOCKET_ID] = 0;
+                composite_info[STREAM_NUMA_NODE_ID] = spans_domains ? -1 : composite_numa_node;
+                composite_info[STREAM_SOCKET_ID] = spans_domains ? -1 : composite_socket;
                 _streams_info_table.push_back(std::move(composite_info));
 
-                std::vector<int> component_info(CPU_STREAMS_TABLE_SIZE, 0);
-                component_info[PROC_TYPE] = EFFICIENT_CORE_PROC;
-                component_info[THREADS_PER_STREAM] = efficient_threads;
-                component_info[STREAM_NUMA_NODE_ID] = 0;
-                component_info[STREAM_SOCKET_ID] = 0;
-                _streams_info_table.push_back(component_info);
-
-                component_info[PROC_TYPE] = LP_EFFICIENT_CORE_PROC;
-                component_info[THREADS_PER_STREAM] = lp_efficient_threads;
-                _streams_info_table.push_back(std::move(component_info));
+                for (size_t i = 0; i < pools.size(); ++i) {
+                    if (component_cores[i] == 0) {
+                        continue;
+                    }
+                    std::vector<int> component_info(CPU_STREAMS_TABLE_SIZE, 0);
+                    component_info[PROC_TYPE] = pools[i].proc_type;
+                    component_info[THREADS_PER_STREAM] = component_cores[i];
+                    component_info[STREAM_NUMA_NODE_ID] = pools[i].numa_node_id;
+                    component_info[STREAM_SOCKET_ID] = pools[i].socket_id;
+                    _streams_info_table.push_back(std::move(component_info));
+                    pools[i].remaining_cores -= component_cores[i];
+                }
             }
         } else {
             int start = proc_type_table.size() > 1 ? 1 : 0;
@@ -338,10 +394,11 @@ void IStreamsExecutor::Config::update_executor_config() {
                 (proc_type_table[0][EFFICIENT_CORE_PROC] > 0) +
                 (proc_type_table[0][LP_EFFICIENT_CORE_PROC] > 0) +
                 (proc_type_table[0][HYPER_THREADING_PROC] > 0);
+            const bool has_multiple_numa_nodes = proc_type_table.size() > 2;
             bool composite_stream = false;
-            // Using cores crossed sockets or hyper threads when streams = 1
+            // Use a composite stream when the request crosses processor types or NUMA allocation domains.
             if (_streams == 1 && _threads_per_stream > proc_type_table[start][ov::MAIN_CORE_PROC] &&
-                active_core_types > 1) {
+                (active_core_types > 1 || has_multiple_numa_nodes)) {
                 composite_stream = true;
                 stream_info[NUMBER_OF_STREAMS] = _streams;
                 stream_info[PROC_TYPE] = ALL_PROC;
