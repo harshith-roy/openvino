@@ -5,6 +5,8 @@
 #include "common_test_utils/node_builders/constant.hpp"
 #include "common_test_utils/node_builders/convolution.hpp"
 #include "common_test_utils/node_builders/eltwise.hpp"
+#include "openvino/op/convolution.hpp"
+#include "openvino/op/multiply.hpp"
 #include "shared_test_classes/base/ov_subgraph.hpp"
 #include "utils/cpu_test_utils.hpp"
 
@@ -49,6 +51,34 @@ protected:
 };
 
 TEST_F(NotFusedConvSimpleOp, smoke_CompareWithRefs) {
+    run();
+}
+
+class NotFusedConvDynamicChannelwiseMul : virtual public ov::test::SubgraphBaseTest {
+protected:
+    void SetUp() override {
+        targetDevice = ov::test::utils::DEVICE_CPU;
+
+        const ov::PartialShape inputShape{1, -1, 12, 9};
+        init_input_shapes({{inputShape, {{1, 3, 12, 9}}}});
+
+        ov::ParameterVector inputParams{std::make_shared<ov::op::v0::Parameter>(ov::element::f32, inputShape)};
+
+        const auto weights = ov::test::utils::make_constant(element::f32, {16, 3, 3, 3});
+        const auto conv = std::make_shared<ov::op::v1::Convolution>(inputParams[0],
+                                                                    weights,
+                                                                    ov::Strides{1, 1},
+                                                                    ov::CoordinateDiff{0, 0},
+                                                                    ov::CoordinateDiff{0, 0},
+                                                                    ov::Strides{1, 1});
+        const auto scaleConst = ov::test::utils::make_constant(element::f32, {1, 16, 1, 1});
+        const auto mul = std::make_shared<ov::op::v1::Multiply>(conv, scaleConst);
+
+        function = std::make_shared<ov::Model>(OutputVector{mul}, inputParams, "NotFusedConvDynamicChannelwiseMul");
+    }
+};
+
+TEST_F(NotFusedConvDynamicChannelwiseMul, smoke_CompareWithRefs) {
     run();
 }
 

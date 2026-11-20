@@ -567,11 +567,27 @@ bool Convolution::canFuse(const NodePtr& node) const {
         if (n->getAlgorithm() != Algorithm::EltwiseMultiply) {
             return false;
         }
+        const auto& outDims = getOutputShapeAtPort(0).getDims();
+        const auto channelAxis = getFusingAxis();
         for (size_t i = 0; i < n->getParentEdges().size(); i++) {
             auto parent = n->getParentEdgeAt(i)->getParent();
-            if (parent.get() != this && parent->isConstant()) {
-                return true;
+            if (parent.get() == this) {
+                continue;
             }
+            if (parent->getType() != Type::Input || !parent->isConstant() || parent->getChildEdges().size() != 1) {
+                return false;
+            }
+            const auto& weightDims = n->getInputShapeAtPort(i).getDims();
+            if (!isPerTensorOrPerChannelBroadcastable(outDims, weightDims, channelAxis, true)) {
+                return false;
+            }
+            const bool isPerTensor =
+                std::accumulate(weightDims.begin(), weightDims.end(), static_cast<size_t>(1), std::multiplies<>()) == 1;
+            if (!isPerTensor && (channelAxis < 0 || static_cast<size_t>(channelAxis) >= outDims.size() ||
+                                 outDims[channelAxis] == Shape::UNDEFINED_DIM)) {
+                return false;
+            }
+            return true;
         }
         return false;
     };
